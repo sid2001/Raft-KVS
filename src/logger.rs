@@ -35,14 +35,21 @@ pub struct Logger {
     store: Option<Box<dyn Store>>,
     last_applied: u64,
     prev_log_index: u64,
-    prev_commit_index: u64,
-    prev_commit_term: u64, // is it required
+    prev_log_term: u64,
+    commit_index: u64,
     commit_term: u64,
     next_index: u64,
     buffer_log: bool,
     prev_persist_index: u64,
     log_file: Option<File>,
     log_file_path: Option<String>,
+}
+
+struct AppendEntry {
+    pub prev_log_index: u64,
+    pub prev_log_term: u64,
+    pub commit_index: u64,
+    pub entries: Vec<LogEntry<MiniRedisRequest>>,
 }
 
 impl Default for Logger {
@@ -52,8 +59,8 @@ impl Default for Logger {
             store: None,
             last_applied: 0,
             prev_log_index: 0,
-            prev_commit_index: 0,
-            prev_commit_term: 0,
+            prev_log_term: 0,
+            commit_index: 0,
             next_index: 0,
             commit_term: 0,
             buffer_log: false,
@@ -79,14 +86,22 @@ impl Logger {
     fn init_log(log: &mut Log, path: &str) -> Result<u64, Box<dyn Error>> {
         println!("Loading logs from {}", path);
         let f = File::open::<String>(path.into())?;
-        let buf_reader = BufReader::new(f);
-
+        let mut buf_reader = BufReader::new(f);
         let mut out = vec![];
-        match bincode::deserialize_from(buf_reader) {
-            Ok(entry) => {
-                out.push(entry);
+        loop {
+            match bincode::deserialize_from(&mut buf_reader) {
+                Ok(entry) => {
+                    out.push(entry);
+                }
+                Err(e) => {
+                    if let bincode::ErrorKind::Io(ref io_err) = *e {
+                        if io_err.kind() == ErrorKind::UnexpectedEof {
+                            break;
+                        }
+                    }
+                    return Err(e.into());
+                }
             }
-            _ => (),
         }
         let len = out.len() as u64;
         *log = Log(out);
@@ -108,11 +123,20 @@ impl Logger {
                 "File path not specified or is incorrect!",
             )));
         }
-        let buf_writer = BufWriter::new(f.unwrap());
+        let mut buf_writer = BufWriter::new(f.unwrap());
 
         let data = &self.log.0.as_slice()[self.prev_persist_index as usize + 1..];
-
-        let _ = bincode::serialize_into(buf_writer, data)?;
+        for d in data {
+            let _ = bincode::serialize_into(&mut buf_writer, d)?;
+        }
         Ok(())
+    }
+    pub fn get_empty_append_entry(&self) -> AppendEntry {
+        AppendEntry {
+            prev_log_index: self.prev_log_index,
+            prev_log_term: self.prev_log_term,
+            commit_index: self.commit_index,
+            entries: vec![],
+        }
     }
 }
