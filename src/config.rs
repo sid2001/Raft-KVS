@@ -1,16 +1,19 @@
+use std::fmt;
+
 #[derive(Debug)]
-struct Server {
-    id: u64,
-    host: String,
-    port: String,
+pub struct Server {
+    pub id: u64,
+    pub host: String,
+    pub port: String,
+    pub endpoint: String,
 }
 
 #[derive(Debug)]
 pub(crate) struct LogConfig {
-    log_file: String,
-    path: String,
-    buffer_log: bool,
-    log_persist_threshold: u64,
+    pub log_file: String,
+    pub path: String,
+    pub buffer_log: bool,
+    pub log_persist_threshold: u64,
 }
 
 impl LogConfig {
@@ -21,19 +24,23 @@ impl LogConfig {
 
 #[derive(Debug)]
 pub(crate) struct Config {
-    peer: Option<Vec<Server>>,
-    server: Server,
-    log_config: LogConfig,
-    nodes: u64,
+    pub servers: Option<Vec<Server>>,
+    pub majority: u64,
+    pub server: Server,
+    pub log_config: LogConfig,
+    pub nodes: u64,
 }
 
 impl Config {
     fn init() -> Config {
+        let port: String = "6969".into();
+        let host: String = "127.0.0.1".into();
         println!("Init Config");
         let server = Server {
             id: 1,
-            host: "127.0.0.1".into(),
-            port: "6969".into(),
+            host: host.clone(),
+            port: port.clone(),
+            endpoint: format!("http://{}:{}", host, port),
         };
         let log_config = LogConfig {
             log_file: "log.rf".into(),
@@ -42,7 +49,8 @@ impl Config {
             log_persist_threshold: 0,
         };
         let config = Config {
-            peer: None,
+            servers: None,
+            majority: 1,
             server,
             log_config,
             nodes: 1,

@@ -6,19 +6,22 @@ use config::Config;
 use core::fmt;
 use proto::raft_rpc_client::RaftRpcClient;
 use proto::raft_rpc_server::{RaftRpc, RaftRpcServer};
-use proto::{self, AppendEntry, AppendEntryResponse, RequestVote, RequestVoteResponse};
+use proto::{AppendEntry, AppendEntryResponse, RequestVote, RequestVoteResponse};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::process::Output;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio::time::{self, Duration, Instant};
+use tonic::server;
 use tonic::{
-    transport::{Endpoint, Server},
+    transport::{self, Endpoint},
     Request, Response, Status,
 };
 
@@ -59,17 +62,41 @@ struct RequestMsg<T: RPCResponse> {
     sender: oneshot::Sender<T>,
 }
 
+//#[derive(Debug)]
+//struct Peer(Endpoint);
+
 #[derive(Debug)]
-struct Peer(Endpoint);
+struct Server {
+    // for each server, index of the next log entry to send to that server (initialised to leader
+    // last log index + 1)
+    next_index: u64,
+
+    // for each server index, of highest log entry known to be replicated on server (initialized to
+    // 0, increases monotonically)
+    match_index: u64,
+
+    endpoint: Endpoint,
+}
+
+impl Server {
+    fn init(&mut self, prev_log_index: u64) {
+        self.next_index = prev_log_index + 1;
+        self.match_index = 0;
+    }
+}
 
 #[derive(Debug)]
 struct Raft {
-    current_term: u64,
     id: u64,
-    voted_for: Option<u32>,
+
+    // Updated on stable storage before responding to RPCs
+    current_term: u64, // latest term server has seen (initialized to 0 on first boot, increases monotonically)
+    voted_for: Option<u64>,
     logger: Logger,
+
     state: Mutex<State>,
-    peers: Vec<Peer>,
+    votes: u64, // do we need mutex on this??
+    servers: HashMap<u64, crate::Server>,
     config: Option<Config>,
 }
 
@@ -79,9 +106,10 @@ impl Default for Raft {
             current_term: 0,
             voted_for: None,
             id: 0,
+            votes: 0,
+            servers: HashMap::new(),
             logger: Logger::default(),
             state: Mutex::new(State::Follower),
-            peers: vec![],
             config: None,
         }
     }
@@ -100,6 +128,20 @@ impl Raft {
     fn init(config: &Config) -> Result<Raft, Box<dyn Error>> {
         let mut raft = Raft::default();
         raft.logger.init(&config.get_log_config())?;
+
+        if let Some(ref servers) = config.servers {
+            for server in servers {
+                let ep = server.endpoint.clone();
+                let serv = crate::Server {
+                    next_index: raft.logger.get_prev_log_index() + 1,
+                    match_index: 0,
+                    // fix this
+                    // todo
+                    endpoint: Endpoint::from_shared(ep).ok().unwrap(),
+                };
+                raft.servers.insert(server.id, serv);
+            }
+        }
         // todo()
         // replicate all necessary configs into raft instance
         //raft.config = Some(config);
@@ -107,14 +149,28 @@ impl Raft {
     }
     fn handle_time_out(&mut self) -> Result<(), Box<dyn Error>> {
         //let client = RaftRpcClient;
+        // todo
+        match self.state.lock() {
+            Ok(mut s) => {
+                *s = State::Candidate;
+            }
+            Err(_) => {
+                return Err(Box::new(MyError("Failed accquiring state lock!".into())));
+            }
+        }
         self.current_term += 1;
+
+        // reinitialize server state after election
+        for (_, server) in &mut self.servers {
+            server.init(self.logger.get_prev_log_index());
+        }
         let _lock = self.state.lock().unwrap();
         Ok(())
     }
 
-    fn get_empty_append_entry(&self) -> proto::AppendEntry {
+    fn get_empty_append_entry(&self) -> AppendEntry {
         let ae = self.logger.get_empty_append_entry();
-        proto::AppendEntry {
+        AppendEntry {
             term: self.current_term,
             leader_id: self.id,
             prev_log_index: ae.prev_log_index,
@@ -125,8 +181,8 @@ impl Raft {
     }
 
     async fn handle_heartbeat(&self) -> Result<(), MyError> {
-        for peer in &self.peers {
-            match RaftRpcClient::connect(peer.0.clone()).await {
+        for (_, peer) in &self.servers {
+            match RaftRpcClient::connect(peer.endpoint.clone()).await {
                 Ok(mut client) => {
                     let _res = client
                         .append_entries_rpc(self.get_empty_append_entry())
@@ -226,7 +282,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let address = config.get_address();
 
     tokio::spawn(
-        Server::builder()
+        transport::Server::builder()
             .add_service(RaftRpcServer::new(rpc_server))
             .serve(address.parse().unwrap()),
     );

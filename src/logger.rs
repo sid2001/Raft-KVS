@@ -10,34 +10,39 @@ use std::io::{BufReader, BufWriter};
 struct MiniRedis;
 impl Store for MiniRedis {}
 #[derive(Debug, Serialize, Deserialize)]
-struct MiniRedisRequest {
-    data: u32, // dummy data
+pub struct MiniRedisRequest {
+    pub data: u32, // dummy data
 }
 impl Data for MiniRedisRequest {}
 use std::fmt::Debug;
 
 type Term = u64;
-trait Data {}
+pub(crate) trait Data {}
 trait Store: Sync + Send + Debug {}
 
 #[derive(Debug, Serialize, Deserialize)]
-struct LogEntry<T: Data> {
-    term: Term,
-    data: T,
+pub(crate) struct LogEntry<T: Data> {
+    pub term: Term,
+    pub data: T,
 }
 
 #[derive(Debug, Default)]
-struct Log(Vec<LogEntry<MiniRedisRequest>>);
+pub(crate) struct Log(pub Vec<LogEntry<MiniRedisRequest>>);
 
 #[derive(Debug)]
-pub struct Logger {
-    log: Log,
+pub(crate) struct Logger {
+    log: Log, // Updated to stable storage before responding to RPCs
     store: Option<Box<dyn Store>>,
+
+    // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
     last_applied: u64,
+
+    // index of highest log entry known to be committed (initialized to 0, increases monotonically)
+    commit_index: u64,
+
     prev_log_index: u64,
     prev_log_term: u64,
-    commit_index: u64,
-    commit_term: u64,
+
     next_index: u64,
     buffer_log: bool,
     prev_persist_index: u64,
@@ -45,7 +50,7 @@ pub struct Logger {
     log_file_path: Option<String>,
 }
 
-struct AppendEntry {
+pub(crate) struct LogAppendEntry {
     pub prev_log_index: u64,
     pub prev_log_term: u64,
     pub commit_index: u64,
@@ -62,7 +67,6 @@ impl Default for Logger {
             prev_log_term: 0,
             commit_index: 0,
             next_index: 0,
-            commit_term: 0,
             buffer_log: false,
             prev_persist_index: 0,
             log_file: None,
@@ -131,12 +135,16 @@ impl Logger {
         }
         Ok(())
     }
-    pub fn get_empty_append_entry(&self) -> AppendEntry {
-        AppendEntry {
+    pub fn get_empty_append_entry(&self) -> LogAppendEntry {
+        LogAppendEntry {
             prev_log_index: self.prev_log_index,
             prev_log_term: self.prev_log_term,
             commit_index: self.commit_index,
             entries: vec![],
         }
+    }
+
+    pub fn get_prev_log_index(&self) -> u64 {
+        self.prev_log_index
     }
 }
