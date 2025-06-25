@@ -8,7 +8,7 @@ use proto::raft_rpc_client::RaftRpcClient;
 use proto::raft_rpc_server::{RaftRpc, RaftRpcServer};
 use proto::{AppendEntry, AppendEntryResponse, RequestVote, RequestVoteResponse};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Debug, Display};
 use std::future::Future;
@@ -16,10 +16,12 @@ use std::net::SocketAddr;
 use std::process::Output;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::thread::sleep;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::time::{self, Duration, Instant};
 use tonic::server;
+use tonic::transport::channel;
 use tonic::{
     transport::{self, Endpoint},
     Request, Response, Status,
@@ -37,7 +39,7 @@ const DEFAULT_CHANNEL_CAPACITY: u32 = 32;
 const DEFAULT_HEART_BEAT_PERIOD: u64 = 50;
 const DEFAULT_TIME_OUT_PERIOD: u64 = 1000;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 enum State {
     Leader,
     Candidate,
@@ -66,7 +68,7 @@ struct RequestMsg<T: RPCResponse> {
 //struct Peer(Endpoint);
 
 #[derive(Debug)]
-struct Server {
+struct ServerAgent {
     // for each server, index of the next log entry to send to that server (initialised to leader
     // last log index + 1)
     next_index: u64,
@@ -76,13 +78,21 @@ struct Server {
     match_index: u64,
 
     endpoint: Endpoint,
+
+    channel_ae: mpsc::Receiver<Msg>,
+    channel_rv: mpsc::Receiver<Msg>,
+
+    request_queue: VecDeque<AppendEntry>,
+    watch_state: watch::Receiver<State>,
 }
 
-impl Server {
-    fn init(&mut self, prev_log_index: u64) {
-        self.next_index = prev_log_index + 1;
-        self.match_index = 0;
-    }
+#[derive(Debug)]
+struct AgentLink {
+    endpoint: Endpoint,
+
+    // communication channel between the server agent and main heart
+    channel_ae: Option<mpsc::Sender<Msg>>,
+    channel_rv: Option<mpsc::Sender<Msg>>,
 }
 
 #[derive(Debug)]
@@ -90,20 +100,20 @@ struct Raft {
     id: u64,
 
     // Updated on stable storage before responding to RPCs
-    current_term: u64, // latest term server has seen (initialized to 0 on first boot, increases monotonically)
+    current_term: Arc<Mutex<u64>>, // latest term server has seen (initialized to 0 on first boot, increases monotonically)
     voted_for: Option<u64>,
     logger: Logger,
 
     state: Mutex<State>,
     votes: u64, // do we need mutex on this??
-    servers: HashMap<u64, crate::Server>,
+    servers: HashMap<u64, AgentLink>,
     config: Option<Config>,
 }
 
 impl Default for Raft {
     fn default() -> Self {
         Self {
-            current_term: 0,
+            current_term: Arc::new(Mutex::new(0)),
             voted_for: None,
             id: 0,
             votes: 0,
@@ -124,22 +134,45 @@ impl Display for MyError {
     }
 }
 
+async fn serve_server(mut sa: ServerAgent) -> Result<(), MyError> {
+    let (tx, rx) = oneshot::channel();
+
+    loop {
+        if *sa.watch_state.borrow() == State::Follower {
+            time::sleep_until(Instant::now() + Duration::from_millis(100)).await;
+            continue;
+        }
+        let ae = sa.channel_ae.recv();
+        let rv = sa.channel_rv.recv();
+        tokio::pin!(rv);
+        tokio::pin!(ae);
+
+        tokio::select! {
+            biased;
+
+            Some(request_v) = rv => {
+                sa.request_queue.push_back(request_v);
+            }
+            Some(entry) = ae =>{
+            },
+
+        }
+    }
+}
+
 impl Raft {
-    fn init(config: &Config) -> Result<Raft, Box<dyn Error>> {
+    fn init(config: Config) -> Result<Raft, Box<dyn Error>> {
         let mut raft = Raft::default();
         raft.logger.init(&config.get_log_config())?;
 
-        if let Some(ref servers) = config.servers {
+        if let Some(servers) = config.servers {
             for server in servers {
-                let ep = server.endpoint.clone();
-                let serv = crate::Server {
-                    next_index: raft.logger.get_prev_log_index() + 1,
-                    match_index: 0,
-                    // fix this
-                    // todo
-                    endpoint: Endpoint::from_shared(ep).ok().unwrap(),
+                let agt_link = AgentLink {
+                    endpoint: Endpoint::from_shared(server.endpoint).ok().unwrap(),
+                    channel_rv: None,
+                    channel_ae: None,
                 };
-                raft.servers.insert(server.id, serv);
+                raft.servers.insert(server.id, agt_link);
             }
         }
         // todo()
@@ -158,7 +191,8 @@ impl Raft {
                 return Err(Box::new(MyError("Failed accquiring state lock!".into())));
             }
         }
-        self.current_term += 1;
+        let mut term = self.current_term.lock().unwrap();
+        *term = *term + 1;
 
         // reinitialize server state after election
         for (_, server) in &mut self.servers {
@@ -171,7 +205,7 @@ impl Raft {
     fn get_empty_append_entry(&self) -> AppendEntry {
         let ae = self.logger.get_empty_append_entry();
         AppendEntry {
-            term: self.current_term,
+            term: *self.current_term.lock().unwrap(), // will be auto copied as value is u64
             leader_id: self.id,
             prev_log_index: ae.prev_log_index,
             prev_log_term: ae.prev_log_term,
@@ -184,6 +218,7 @@ impl Raft {
         for (_, peer) in &self.servers {
             match RaftRpcClient::connect(peer.endpoint.clone()).await {
                 Ok(mut client) => {
+                    let (o_tx, o_rx) = oneshot::channel();
                     let _res = client
                         .append_entries_rpc(self.get_empty_append_entry())
                         .await;
@@ -198,16 +233,43 @@ impl Raft {
 
     async fn heart(
         &mut self,
-        ch: &mut Receiver<RequestMsg<ResponseMsg>>,
+        ch_ae: &mut Receiver<RequestMsg<ResponseMsg>>,
+        ch_rv: &mut Receiver<RequestMsg<ResponseMsg>>,
     ) -> Result<(), Box<dyn Error>> {
         //tokio::spawn(Raft::heartbeat(&mut self));
+        // todo randomize timeout duration
         let timeout =
             time::sleep_until(Instant::now() + Duration::from_millis(DEFAULT_TIME_OUT_PERIOD));
-        let mut heartbeat =
+        let heartbeat =
             time::sleep_until(Instant::now() + Duration::from_millis(DEFAULT_HEART_BEAT_PERIOD));
+
+        let (tx_ws, rx_ws) = watch::channel(*(self.state.lock().unwrap()));
 
         tokio::pin!(timeout); // this is done if same sleep in continuously called in select
         tokio::pin!(heartbeat);
+
+        // heart<--->server_agent<--->server1
+        //     |
+        //     <---->server_agent<--->server2
+        for (_, ep) in &mut self.servers {
+            let (tx_ae, rx_ae) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY as usize);
+            let (tx_rv, rx_rv) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY as usize);
+
+            ep.channel_rv = Some(tx_rv);
+            ep.channel_ae = Some(tx_ae);
+
+            let sa = ServerAgent {
+                next_index: self.logger.get_prev_log_index() + 1,
+                match_index: 0,
+
+                endpoint: ep.endpoint.clone(),
+                channel_ae: rx_ae,
+                channel_rv: rx_rv,
+                watch_state: rx_ws.clone(),
+                request_queue: VecDeque::new(),
+            };
+            tokio::spawn(serve_server(sa));
+        }
 
         loop {
             tokio::select! {
@@ -224,8 +286,11 @@ impl Raft {
                     heartbeat.as_mut().reset(Instant::now() + Duration::from_millis(DEFAULT_TIME_OUT_PERIOD));
                     self.handle_heartbeat().await?;
                 },
-                _req = ch.recv() => {
+                _req = ch_ae.recv() => {
                     timeout.as_mut().reset(Instant::now() + Duration::from_millis(DEFAULT_TIME_OUT_PERIOD));
+                },
+                _req = ch_rv.recv() => {
+
                 }
             }
         }
@@ -233,7 +298,8 @@ impl Raft {
 }
 
 struct RPCServer {
-    sender: mpsc::Sender<RequestMsg<ResponseMsg>>,
+    sender_ae: mpsc::Sender<RequestMsg<ResponseMsg>>,
+    sender_rv: mpsc::Sender<RequestMsg<ResponseMsg>>,
 }
 
 #[tonic::async_trait]
@@ -244,7 +310,7 @@ impl RaftRpc for RPCServer {
     ) -> Result<Response<RequestVoteResponse>, Status> {
         let (o_tx, o_rx) = oneshot::channel::<ResponseMsg>();
         match self
-            .sender
+            .sender_ae
             .send(RequestMsg {
                 msg: Msg::RequestVote(request.get_ref().clone()),
                 sender: o_tx,
@@ -275,17 +341,21 @@ impl RaftRpc for RPCServer {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let (tx, mut rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY as usize);
+    let (tx_ae, mut rx_ae) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY as usize);
+    let (tx_rv, mut rx_rv) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY as usize);
     let config = Config::load_config();
-    let mut raft = Raft::init(&config)?;
-    let rpc_server = RPCServer { sender: tx };
     let address = config.get_address();
+    let mut raft = Raft::init(config)?;
+    let rpc_server = RPCServer {
+        sender_ae: tx_ae,
+        sender_rv: tx_rv,
+    };
 
     tokio::spawn(
         transport::Server::builder()
             .add_service(RaftRpcServer::new(rpc_server))
             .serve(address.parse().unwrap()),
     );
-    let _ = raft.heart(&mut rx).await;
+    let _ = raft.heart(&mut rx_ae, &mut rx_rv).await;
     Ok(())
 }
