@@ -135,7 +135,7 @@ impl Logger {
         }
         Ok(())
     }
-    pub fn get_empty_append_entry(&self) -> LogAppendEntry {
+    pub(crate) fn get_empty_append_entry(&self) -> LogAppendEntry {
         LogAppendEntry {
             prev_log_index: self.prev_log_index,
             prev_log_term: self.prev_log_term,
@@ -144,7 +144,10 @@ impl Logger {
         }
     }
 
-    pub fn get_prev_log_index(&self) -> u64 {
+    pub(crate) fn get_prev_log_index(&self) -> u64 {
         self.prev_log_index
+    }
+    pub(crate) fn get_prev_log_term(&self) -> u64 {
+        self.prev_log_term
     }
 }

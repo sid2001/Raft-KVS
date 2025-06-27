@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{oneshot, watch};
-use tokio::time::{self, Duration, Instant};
+use tokio::time::{self, timeout, Duration, Instant};
 use tonic::server;
 use tonic::transport::channel;
 use tonic::{
@@ -61,7 +61,7 @@ impl RPCResponse for ResponseMsg {}
 
 struct RequestMsg<T: RPCResponse> {
     msg: Msg,
-    sender: oneshot::Sender<T>,
+    sender: mpsc::Sender<T>,
 }
 
 //#[derive(Debug)]
@@ -77,10 +77,12 @@ struct ServerAgent {
     // 0, increases monotonically)
     match_index: u64,
 
+    term: u64,
+
     endpoint: Endpoint,
 
-    channel_ae: mpsc::Receiver<Msg>,
-    channel_rv: mpsc::Receiver<Msg>,
+    channel_ae: mpsc::Receiver<RequestMsg<ResponseMsg>>,
+    channel_rv: mpsc::Receiver<RequestMsg<ResponseMsg>>,
 
     request_queue: VecDeque<AppendEntry>,
     watch_state: watch::Receiver<State>,
@@ -91,8 +93,8 @@ struct AgentLink {
     endpoint: Endpoint,
 
     // communication channel between the server agent and main heart
-    channel_ae: Option<mpsc::Sender<Msg>>,
-    channel_rv: Option<mpsc::Sender<Msg>>,
+    channel_ae: Option<mpsc::Sender<RequestMsg<ResponseMsg>>>,
+    channel_rv: Option<mpsc::Sender<RequestMsg<ResponseMsg>>>,
 }
 
 #[derive(Debug)]
@@ -102,10 +104,11 @@ struct Raft {
     // Updated on stable storage before responding to RPCs
     current_term: Arc<Mutex<u64>>, // latest term server has seen (initialized to 0 on first boot, increases monotonically)
     voted_for: Option<u64>,
-    logger: Logger,
+    logger: Arc<Mutex<Logger>>,
 
     state: Mutex<State>,
     votes: u64, // do we need mutex on this??
+    majority: u64,
     servers: HashMap<u64, AgentLink>,
     config: Option<Config>,
 }
@@ -117,8 +120,9 @@ impl Default for Raft {
             voted_for: None,
             id: 0,
             votes: 0,
+            majority: 0, // todo this zero value looks waste; maybe change it to Option::None
             servers: HashMap::new(),
-            logger: Logger::default(),
+            logger: Arc::new(Mutex::new(Logger::default())),
             state: Mutex::new(State::Follower),
             config: None,
         }
@@ -134,7 +138,11 @@ impl Display for MyError {
     }
 }
 
-async fn serve_server(mut sa: ServerAgent) -> Result<(), MyError> {
+async fn serve_server(
+    mut sa: ServerAgent,
+    logger: Arc<Mutex<Logger>>,
+    term: Arc<Mutex<u64>>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (tx, rx) = oneshot::channel();
 
     loop {
@@ -151,11 +159,22 @@ async fn serve_server(mut sa: ServerAgent) -> Result<(), MyError> {
             biased;
 
             Some(request_v) = rv => {
-                sa.request_queue.push_back(request_v);
-            }
-            Some(entry) = ae =>{
-            },
+                // resetting server agents' volatile states
+                sa.next_index = logger.lock().unwrap().get_prev_log_index() + 1;
+                sa.match_index = 0;
 
+                let mut client = RaftRpcClient::connect(sa.endpoint.clone()).await?;
+                match request_v.msg {
+                    Msg::RequestVote(req) => {
+                        let res = client.request_vote_rpc(req).await?;
+                        if let Err(err) = request_v.sender.send(ResponseMsg::RequestVoteResponse(res.into_inner())).await{
+                            return Err(Box::new(MyError("Kand ho gaya bhai vote response nhi gaya heart ko!!".to_string())));
+                        }
+                    },
+                    _ => ()
+                }
+            }
+            Some(entry) = ae =>{},
         }
     }
 }
@@ -163,7 +182,7 @@ async fn serve_server(mut sa: ServerAgent) -> Result<(), MyError> {
 impl Raft {
     fn init(config: Config) -> Result<Raft, Box<dyn Error>> {
         let mut raft = Raft::default();
-        raft.logger.init(&config.get_log_config())?;
+        raft.logger.lock().unwrap().init(&config.get_log_config())?;
 
         if let Some(servers) = config.servers {
             for server in servers {
@@ -180,6 +199,16 @@ impl Raft {
         //raft.config = Some(config);
         Ok(raft)
     }
+
+    fn term_checker(&self, term: u64) -> bool {
+        if *self.current_term.lock().unwrap() > term {
+            false
+        } else {
+            true
+        }
+    }
+
+    // delete this method no use now
     fn handle_time_out(&mut self) -> Result<(), Box<dyn Error>> {
         //let client = RaftRpcClient;
         // todo
@@ -196,14 +225,14 @@ impl Raft {
 
         // reinitialize server state after election
         for (_, server) in &mut self.servers {
-            server.init(self.logger.get_prev_log_index());
+            server.init(self.logger.lock().unwrap().get_prev_log_index());
         }
         let _lock = self.state.lock().unwrap();
         Ok(())
     }
 
     fn get_empty_append_entry(&self) -> AppendEntry {
-        let ae = self.logger.get_empty_append_entry();
+        let ae = self.logger.lock().unwrap().get_empty_append_entry();
         AppendEntry {
             term: *self.current_term.lock().unwrap(), // will be auto copied as value is u64
             leader_id: self.id,
@@ -259,8 +288,9 @@ impl Raft {
             ep.channel_ae = Some(tx_ae);
 
             let sa = ServerAgent {
-                next_index: self.logger.get_prev_log_index() + 1,
+                next_index: self.logger.lock().unwrap().get_prev_log_index() + 1,
                 match_index: 0,
+                term: *self.current_term.lock().unwrap(),
 
                 endpoint: ep.endpoint.clone(),
                 channel_ae: rx_ae,
@@ -268,19 +298,79 @@ impl Raft {
                 watch_state: rx_ws.clone(),
                 request_queue: VecDeque::new(),
             };
-            tokio::spawn(serve_server(sa));
+            tokio::spawn(serve_server(
+                sa,
+                self.logger.clone(),
+                self.current_term.clone(),
+            ));
         }
 
         loop {
             tokio::select! {
+                biased;
                 // this is prone to stall if lock is contented hopefully this lock is only used
                 // when changing state or reading which has to be exclusive among each ohter so the
                 // contention good in this scenario as the other recv branch also depends on lock
                 // state
                 () = &mut timeout, if *(self.state.lock().unwrap()) != State::Leader => {
+                    // todo re-code this portion to listen to incoming request votes from other
+                    // candidates maybe this work perfectly say this server has timedout and voted
+                    // for itself so any other vote request should be reject by this one also if
+                    // some other candidate is selected as a leader first that means this node will
+                    // not receive enough vote and eventually gets timed out. Now this heart should
+                    // wait after election period so that the other leader can ack this server
+                    // but if this server becomes the leader then immediately it will send ack to
+                    // other follower, this operation will be carried by the server agents
+                    // automatically as the server will again become a leader
                     println!("Oh timer expired do something please onicha!!");
                     timeout.as_mut().reset(Instant::now() + Duration::from_millis(DEFAULT_TIME_OUT_PERIOD));
-                    todo!();
+                    *self.state.lock().unwrap() = State::Candidate;
+                    *self.current_term.lock().unwrap() += 1;
+                    self.votes = 0;
+
+                    self.voted_for = Some(self.id);
+                    let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY as usize); // make the default channel capacity into number of servers it is waiting for
+                    for (_, agt_link) in self.servers {
+                        if let Some(ch) = agt_link.channel_rv {
+                            let request = Msg::RequestVote(
+                                RequestVote {
+                                    term: *self.current_term.lock().unwrap(),
+                                    candidate_id: self.id,
+                                    last_log_index: self.logger.get_prev_log_index(),
+                                    last_log_term: self.logger.get_prev_log_term()
+                                }
+                            );
+                            ch.send(RequestMsg {
+                                msg: request,
+                                sender: tx.clone()
+                            });
+                        }
+                    }
+                    loop {
+                        // it should wait for some time for the vote responses before the timeout
+                        // timeout will be detected once all the server agents waiting for response
+                        // gets timed out and returns a false response; enough failed responses
+                        // will fail achieving majority votes
+                        if let Some(res) = rx.recv().await {
+                            match res {
+                                ResponseMsg::RequestVoteResponse(v_res) => {
+                                    if self.term_checker(v_res.term) && v_res.vote_granted{
+                                        self.votes += 1;
+                                    }
+                                    if self.votes >= self.majority {
+                                        // change the state to leader
+                                        *self.state.lock().unwrap() = State::Leader;
+                                        break;
+                                    }
+                                }
+                                _ => ()
+                            }
+                        }else{
+                            println!("This node has lost leader election!!");
+                            // now wait for ack from other candidate
+                            timeout.reset(Instant::now() + Duration::from_millis(DEFAULT_TIME_OUT_PERIOD));
+                        }
+                    }
                 },
                 () = &mut heartbeat, if *(self.state.lock().unwrap()) == State::Leader => {
                     heartbeat.as_mut().reset(Instant::now() + Duration::from_millis(DEFAULT_TIME_OUT_PERIOD));
