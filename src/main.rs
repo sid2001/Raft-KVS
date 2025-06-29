@@ -57,6 +57,13 @@ enum ResponseMsg {
     RequestVoteResponse(RequestVoteResponse),
     AppendEntryResponse(AppendEntryResponse),
 }
+
+impl ResponseMsg {
+    fn new_vr(term: u64, vote_granted: bool) -> ResponseMsg {
+        ResponseMsg::RequestVoteResponse(RequestVoteResponse { term, vote_granted })
+    }
+}
+
 impl RPCResponse for ResponseMsg {}
 
 struct RequestMsg<T: RPCResponse> {
@@ -166,9 +173,13 @@ async fn serve_server(
                 let mut client = RaftRpcClient::connect(sa.endpoint.clone()).await?;
                 match request_v.msg {
                     Msg::RequestVote(req) => {
+                        // repeat vote request if response is not received ---todo once the timing is
+                        // decided for election timeout and request timeout
                         let res = client.request_vote_rpc(req).await?;
-                        if let Err(err) = request_v.sender.send(ResponseMsg::RequestVoteResponse(res.into_inner())).await{
-                            return Err(Box::new(MyError("Kand ho gaya bhai vote response nhi gaya heart ko!!".to_string())));
+                        if let Err(_) = request_v.sender.send(ResponseMsg::RequestVoteResponse(res.into_inner())).await{
+                             println!("Election got over before the response was received or maybe an error!!");
+                        }else{
+                            request_v.sender.send(ResponseMsg::RequestVoteResponse(res.into_inner())).await;
                         }
                     },
                     _ => ()
@@ -200,14 +211,21 @@ impl Raft {
         Ok(raft)
     }
 
-    fn term_checker(&self, term: u64) -> bool {
-        if *self.current_term.lock().unwrap() > term {
-            false
-        } else {
+    fn term_checker_greater(&self, term: u64) -> bool {
+        if *self.current_term.lock().unwrap() < term {
             true
+        } else {
+            false
         }
     }
 
+    fn term_checker_equal(&self, term: u64) -> bool {
+        if *self.current_term.lock().unwrap() == term {
+            true
+        } else {
+            false
+        }
+    }
     // delete this method no use now
     fn handle_time_out(&mut self) -> Result<(), Box<dyn Error>> {
         //let client = RaftRpcClient;
@@ -332,18 +350,20 @@ impl Raft {
                     let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY as usize); // make the default channel capacity into number of servers it is waiting for
                     for (_, agt_link) in self.servers {
                         if let Some(ch) = agt_link.channel_rv {
+                            let logger = self.logger.lock().unwrap();
                             let request = Msg::RequestVote(
                                 RequestVote {
                                     term: *self.current_term.lock().unwrap(),
                                     candidate_id: self.id,
-                                    last_log_index: self.logger.get_prev_log_index(),
-                                    last_log_term: self.logger.get_prev_log_term()
+                                    last_log_index: logger.get_prev_log_index(),
+                                    last_log_term: logger.get_prev_log_term()
                                 }
                             );
+                            drop(logger);
                             ch.send(RequestMsg {
                                 msg: request,
                                 sender: tx.clone()
-                            });
+                            }).await;
                         }
                     }
                     loop {
@@ -354,12 +374,24 @@ impl Raft {
                         if let Some(res) = rx.recv().await {
                             match res {
                                 ResponseMsg::RequestVoteResponse(v_res) => {
-                                    if self.term_checker(v_res.term) && v_res.vote_granted{
+                                    if self.term_checker_greater(v_res.term) {
+                                        *self.current_term.lock().unwrap() = v_res.term; // -- wrap
+                                        *self.state.lock().unwrap() = State::Follower;
+                                        self.voted_for = None;
+                                        tx_ws.send(State::Follower);
+                                        timeout.reset(Instant::now() + Duration::from_millis(DEFAULT_TIME_OUT_PERIOD));
+                                        break;
+                                    }
+                                    else if self.term_checker_equal(v_res.term) && v_res.vote_granted {
                                         self.votes += 1;
                                     }
                                     if self.votes >= self.majority {
                                         // change the state to leader
+                                        //
+                                        // todo wrap state change functionality into a function or
+                                        // a method
                                         *self.state.lock().unwrap() = State::Leader;
+                                        tx_ws.send(State::Leader);
                                         break;
                                     }
                                 }
@@ -377,10 +409,58 @@ impl Raft {
                     self.handle_heartbeat().await?;
                 },
                 _req = ch_ae.recv() => {
+
                     timeout.as_mut().reset(Instant::now() + Duration::from_millis(DEFAULT_TIME_OUT_PERIOD));
                 },
-                _req = ch_rv.recv() => {
+                Some(req) = ch_rv.recv() => {
+                    match req.msg {
+                        Msg::RequestVote(r) => {
+                            // if term < current_term or already voted then return vote not granted
+                            // if term >= current_term and log index is not updated
+                            // todo another check for log term when repeated request vote is
+                            // implemented
+                            let mut res;
+                            let term = self.current_term.lock().unwrap();
+                            let state = self.state.lock().unwrap();
+                            let logger = self.logger.lock().unwrap();
+                            if self.term_checker_greater(r.term){
+                                *term = r.term;
+                                *state = State::Follower;
+                                self.voted_for = None;
+                                timeout.reset(Instant::now() + Duration::from_millis(DEFAULT_TIME_OUT_PERIOD));
 
+                                if logger.log_index_term_checker(r.last_log_index, r.last_log_term) {
+                                    // ---yes
+                                    res = ResponseMsg::new_vr(r.term, true);
+                                } else {
+                                    // --no
+                                    res = ResponseMsg::new_vr(r.term, false);
+                                }
+                            } else if self.term_checker_equal(r.term) {
+                                if (self.voted_for.is_none() && logger.log_index_term_checker(r.last_log_index,r.last_log_term)) || (self.voted_for.unwrap() == r.candidate_id && logger.log_index_term_checker_equal(r.last_log_index, r.last_log_term)) {
+                                    // --yes
+                                    res = ResponseMsg::new_vr(r.term, true);
+                                    timeout.reset(Instant::now() + Duration::from_millis(DEFAULT_TIME_OUT_PERIOD));
+                                } else {
+                                    // --no
+                                    res = ResponseMsg::new_vr(r.term, false);
+                                }
+                            } else {
+                                // --no
+                                res = ResponseMsg::new_vr(*self.current_term.lock().unwrap(), false);
+                            }
+
+                            tx_ws.send((*self.state.lock().unwrap()).clone());
+                            match req.sender.send(res).await {
+                                Err(err) => {
+                                    println!("Can send response to rpc handler!!");
+                                    return Err(Box::new(err));
+                                }
+                                _ => ()
+                            }
+                        },
+                        _ => ()
+                    }
                 }
             }
         }
@@ -398,12 +478,12 @@ impl RaftRpc for RPCServer {
         &self,
         request: Request<RequestVote>,
     ) -> Result<Response<RequestVoteResponse>, Status> {
-        let (o_tx, o_rx) = oneshot::channel::<ResponseMsg>();
+        let (tx, mut rx) = mpsc::channel::<ResponseMsg>(DEFAULT_CHANNEL_CAPACITY as usize);
         match self
             .sender_ae
             .send(RequestMsg {
                 msg: Msg::RequestVote(request.get_ref().clone()),
-                sender: o_tx,
+                sender: tx,
             })
             .await
         {
@@ -413,12 +493,12 @@ impl RaftRpc for RPCServer {
                 todo!();
             }
         }
-        match o_rx.await {
-            Ok(v) => match v {
+        match rx.recv().await {
+            Some(v) => match v {
                 ResponseMsg::RequestVoteResponse(msg) => Ok(Response::new(msg)),
                 _ => Err(Status::new(tonic::Code::Unknown, "hm something went wrong")),
             },
-            Err(_) => Err(Status::new(tonic::Code::Unknown, "hm something went wrong")),
+            None => Err(Status::new(tonic::Code::Unknown, "hm something went wrong")),
         }
     }
     async fn append_entries_rpc(

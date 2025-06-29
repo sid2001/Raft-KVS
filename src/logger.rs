@@ -150,4 +150,21 @@ impl Logger {
     pub(crate) fn get_prev_log_term(&self) -> u64 {
         self.prev_log_term
     }
+
+    pub(crate) fn log_index_term_checker(&self, index: u64, term: u64) -> bool {
+        if (self.prev_log_term < term)
+            || (self.prev_log_term == term && self.prev_log_index <= index)
+        {
+            true
+        } else {
+            false
+        }
+    }
+    pub(crate) fn log_index_term_checker_equal(&self, index: u64, term: u64) -> bool {
+        if self.prev_log_term == term && self.prev_log_index == index {
+            true
+        } else {
+            false
+        }
+    }
 }
