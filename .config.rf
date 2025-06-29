@@ -1,0 +1,36 @@
+{
+  "servers": [
+    {
+      "id": 1,
+      "host": "127.0.0.1",
+      "port": "50051",
+      "endpoint": "http://127.0.0.1:50051"
+    },
+    {
+      "id": 2,
+      "host": "127.0.0.1",
+      "port": "50052",
+      "endpoint": "http://127.0.0.1:50052"
+    },
+    {
+      "id": 3,
+      "host": "127.0.0.1",
+      "port": "50053",
+      "endpoint": "http://127.0.0.1:50053"
+    }
+  ],
+  "majority": 2,
+  "server": {
+    "id": 0,
+    "host": "",
+    "port": "",
+    "endpoint": ""
+  },
+  "log_config": {
+    "log_file": "log.rf",
+    "path": ".",
+    "buffer_log": true,
+    "log_persist_threshold": 10
+  },
+  "nodes": 3
+}

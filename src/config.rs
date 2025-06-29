@@ -1,6 +1,9 @@
-use std::fmt;
+use serde::{Deserialize, Serialize};
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, Read};
+use std::{env, fmt};
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Server {
     pub id: u64,
     pub host: String,
@@ -8,7 +11,7 @@ pub struct Server {
     pub endpoint: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct LogConfig {
     pub log_file: String,
     pub path: String,
@@ -22,9 +25,9 @@ impl LogConfig {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct Config {
-    pub servers: Option<Vec<Server>>,
+    pub servers: Vec<Server>,
     pub majority: u64,
     pub server: Server,
     pub log_config: LogConfig,
@@ -32,32 +35,30 @@ pub(crate) struct Config {
 }
 
 impl Config {
-    fn init() -> Config {
-        let port: String = "6969".into();
-        let host: String = "127.0.0.1".into();
+    fn init() -> Result<Config, std::io::Error> {
+        let file = File::open("./.config.rf")?;
+        let args: Vec<String> = env::args().collect();
+        if args.len() < 2 {
+            eprintln!("Provide server id.");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "server id not provided",
+            ));
+        }
+        let reader = BufReader::new(file);
+
+        let mut config: Config = serde_json::from_reader(reader)?;
+        let id = match args[1].parse::<usize>() {
+            Ok(i) => i,
+            Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::Other, "invalid id")),
+        };
+
         println!("Init Config");
-        let server = Server {
-            id: 1,
-            host: host.clone(),
-            port: port.clone(),
-            endpoint: format!("http://{}:{}", host, port),
-        };
-        let log_config = LogConfig {
-            log_file: "log.rf".into(),
-            path: ".".into(),
-            buffer_log: false,
-            log_persist_threshold: 0,
-        };
-        let config = Config {
-            servers: None,
-            majority: 1,
-            server,
-            log_config,
-            nodes: 1,
-        };
-        config
+        config.server = config.servers[id - 1].clone();
+        println!("config loaded {:?}", config);
+        Ok(config)
     }
-    pub fn load_config() -> Config {
+    pub fn load_config() -> Result<Config, std::io::Error> {
         println!("Loading config");
         Config::init()
     }
