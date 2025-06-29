@@ -37,7 +37,7 @@ trait RPCResponse {}
 
 const DEFAULT_CHANNEL_CAPACITY: u32 = 32;
 const DEFAULT_HEART_BEAT_PERIOD: u64 = 50;
-const DEFAULT_TIME_OUT_PERIOD: u64 = 1000;
+const DEFAULT_TIME_OUT_PERIOD: u64 = 5000;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 enum State {
@@ -59,8 +59,12 @@ enum ResponseMsg {
 }
 
 impl ResponseMsg {
-    fn new_vr(term: u64, vote_granted: bool) -> ResponseMsg {
-        ResponseMsg::RequestVoteResponse(RequestVoteResponse { term, vote_granted })
+    fn new_vr(term: u64, vote_granted: bool, candidate_id: u64) -> ResponseMsg {
+        ResponseMsg::RequestVoteResponse(RequestVoteResponse {
+            term,
+            vote_granted,
+            candidate_id,
+        })
     }
 }
 
@@ -168,10 +172,10 @@ async fn serve_server(
             Some(request_v) = rv => {
                 println!("Request vote(SA)");
                 // resetting server agents' volatile states
-                sa.next_index = logger.lock().unwrap().get_prev_log_index() + 1;
+                sa.next_index = {logger.lock().unwrap().get_prev_log_index() + 1};
                 sa.match_index = 0;
 
-                match RaftRpcClient::connect(sa.endpoint.clone()).await {
+                match RaftRpcClient::connect(sa.endpoint.clone().timeout(Duration::from_millis(500))).await {
                     Ok(mut client) => {
                         match request_v.msg {
                             Msg::RequestVote(req) => {
@@ -187,11 +191,14 @@ async fn serve_server(
                     }
                     Err(_) => {
                         eprintln!("Couldn't connect with the server");
-                        drop(request_v.sender);
                     }
                 };
+                drop(request_v.sender);
             }
             Some(_entry) = ae =>{},
+            else => {
+                continue;
+            }
         }
     }
 }
@@ -201,6 +208,7 @@ impl Raft {
         let mut raft = Raft::default();
         raft.logger.lock().unwrap().init(&config.get_log_config())?;
         raft.id = config.server.id;
+        raft.majority = config.majority;
 
         for (i, server) in config.servers.iter().enumerate() {
             println!("init servers: {}", raft.id);
@@ -221,16 +229,16 @@ impl Raft {
         Ok(raft)
     }
 
-    fn term_checker_greater(&self, term: u64) -> bool {
-        if *self.current_term.lock().unwrap() < term {
+    fn term_checker_greater(current_term: u64, term: u64) -> bool {
+        if current_term < term {
             true
         } else {
             false
         }
     }
 
-    fn term_checker_equal(&self, term: u64) -> bool {
-        if *self.current_term.lock().unwrap() == term {
+    fn term_checker_equal(current_term: u64, term: u64) -> bool {
+        if current_term == term {
             true
         } else {
             false
@@ -315,9 +323,9 @@ impl Raft {
                     // other follower, this operation will be carried by the server agents
                     // automatically as the server will again become a leader
                     println!("Oh timer expired do something please onicha!!");
-                    *self.state.lock().unwrap() = State::Candidate; // --wrap
-                    *self.current_term.lock().unwrap() += 1;
-                    self.votes = 0;
+                    {*self.state.lock().unwrap() = State::Candidate; // --wrap
+                    *self.current_term.lock().unwrap() += 1;}
+                    self.votes = 1;
                     tx_ws.send(State::Candidate);
 
                     self.voted_for = Some(self.id);
@@ -325,9 +333,10 @@ impl Raft {
                     for (_, agt_link) in &self.servers {
                         if let Some(ref ch) = agt_link.channel_rv {
                             let logger = self.logger.lock().unwrap();
+                            let term = self.current_term.lock().unwrap();
                             let request = Msg::RequestVote(
                                 RequestVote {
-                                    term: *self.current_term.lock().unwrap(),
+                                    term: *term,
                                     candidate_id: self.id,
                                     last_log_index: logger.get_prev_log_index(),
                                     last_log_term: logger.get_prev_log_term()
@@ -349,23 +358,27 @@ impl Raft {
                         if let Some(res) = rx.recv().await {
                             match res {
                                 ResponseMsg::RequestVoteResponse(v_res) => {
-                                    println!("Received res msg from sa");
-                                    if self.term_checker_greater(v_res.term) {
-                                        *self.current_term.lock().unwrap() = v_res.term; // -- wrap
-                                        *self.state.lock().unwrap() = State::Follower;
+                                    let mut state = self.state.lock().unwrap();
+                                    let mut term = self.current_term.lock().unwrap();
+                                    println!("Received res msg from sa term {}, cand {} granted {} curr_term {}",v_res.term,v_res.candidate_id,v_res.vote_granted, *term);
+                                    if Raft::term_checker_greater(*term,v_res.term) {
+                                        *term = v_res.term; // -- wrap
+                                        *state = State::Follower;
                                         self.voted_for = None;
                                         tx_ws.send(State::Follower);
                                         //timeout.as_mut().reset(Instant::now() + Duration::from_millis(DEFAULT_TIME_OUT_PERIOD));
                                         break;
-                                    } else if self.term_checker_equal(v_res.term) && v_res.vote_granted {
+                                    } else if Raft::term_checker_equal(*term, v_res.term) && v_res.vote_granted {
+                                        println!("one vote recvd from {}",v_res.candidate_id);
                                         self.votes += 1;
                                     }
                                     if self.votes >= self.majority {
+                                        println!("Election won. term {} votes {} maj {}",*term, self.votes, self.majority);
                                         // change the state to leader
                                         //
                                         // todo wrap state change functionality into a function or
                                         // a method
-                                        *self.state.lock().unwrap() = State::Leader;
+                                        *state = State::Leader;
                                         tx_ws.send(State::Leader);
                                         break;
                                     }
@@ -375,7 +388,7 @@ impl Raft {
                         } else {
                             println!("This node has lost leader election!!");
                             // now wait for ack from other candidate
-                            timeout.as_mut().reset(Instant::now() + Duration::from_millis(10000));
+                            //timeout.as_mut().reset(Instant::now() + Duration::from_millis(10000));
                             break;
                         }
                     }
@@ -391,6 +404,7 @@ impl Raft {
                 Some(req) = ch_rv.recv() => {
                     match req.msg {
                         Msg::RequestVote(r) => {
+                            println!("Vote request is being evaluated");
                             // if term < current_term or already voted then return vote not granted
                             // if term >= current_term and log index is not updated
                             // todo another check for log term when repeated request vote is
@@ -399,7 +413,7 @@ impl Raft {
                             let mut term = self.current_term.lock().unwrap();
                             let mut state = self.state.lock().unwrap();
                             let logger = self.logger.lock().unwrap();
-                            if self.term_checker_greater(r.term){
+                            if Raft::term_checker_greater(*term, r.term){
                                 *term = r.term;
                                 *state = State::Follower;
                                 self.voted_for = None;
@@ -407,29 +421,34 @@ impl Raft {
 
                                 if logger.log_index_term_checker(r.last_log_index, r.last_log_term) {
                                     // ---yes
-                                    res = ResponseMsg::new_vr(r.term, true);
+                                    self.voted_for = Some(r.candidate_id);
+                                    res = ResponseMsg::new_vr(r.term, true,self.id);
                                 } else {
                                     // --no
-                                    res = ResponseMsg::new_vr(r.term, false);
+                                    res = ResponseMsg::new_vr(r.term, false,self.id);
                                 }
-                            } else if self.term_checker_equal(r.term) {
+                            } else if Raft::term_checker_equal(*term, r.term) {
                                 if (self.voted_for.is_none() && logger.log_index_term_checker(r.last_log_index,r.last_log_term)) || (self.voted_for.unwrap() == r.candidate_id && logger.log_index_term_checker_equal(r.last_log_index, r.last_log_term)) {
                                     // --yes
-                                    res = ResponseMsg::new_vr(r.term, true);
+                                    self.voted_for = Some(r.candidate_id);
+                                    res = ResponseMsg::new_vr(r.term, true, self.id);
                                     //timeout.reset(Instant::now() + Duration::from_millis(DEFAULT_TIME_OUT_PERIOD));
                                 } else {
                                     // --no
-                                    res = ResponseMsg::new_vr(r.term, false);
+                                    res = ResponseMsg::new_vr(r.term, false, self.id);
                                 }
                             } else {
                                 // --no
-                                res = ResponseMsg::new_vr(*self.current_term.lock().unwrap(), false);
+                                res = ResponseMsg::new_vr(*term, false, self.id);
                             }
-
-                            tx_ws.send((*self.state.lock().unwrap()).clone());
+                            if self.voted_for.is_none() || self.voted_for.unwrap() != self.id {
+                                *state = State::Follower;
+                            }
+                            tx_ws.send((*state).clone());
+                            println!("evaluation completed");
                             match req.sender.send(res).await {
                                 Err(err) => {
-                                    println!("Can send response to rpc handler!!");
+                                    println!("Can't send response to rpc handler!!");
                                     return Err(Box::new(err));
                                 }
                                 _ => ()
@@ -455,8 +474,9 @@ impl RaftRpc for RPCServer {
         request: Request<RequestVote>,
     ) -> Result<Response<RequestVoteResponse>, Status> {
         let (tx, mut rx) = mpsc::channel::<ResponseMsg>(DEFAULT_CHANNEL_CAPACITY as usize);
+        println!("Request vote incoming");
         match self
-            .sender_ae
+            .sender_rv
             .send(RequestMsg {
                 msg: Msg::RequestVote(request.get_ref().clone()),
                 sender: tx,
@@ -470,10 +490,13 @@ impl RaftRpc for RPCServer {
             }
         }
         match rx.recv().await {
-            Some(v) => match v {
-                ResponseMsg::RequestVoteResponse(msg) => Ok(Response::new(msg)),
-                _ => Err(Status::new(tonic::Code::Unknown, "hm something went wrong")),
-            },
+            Some(v) => {
+                println!("vote res received");
+                match v {
+                    ResponseMsg::RequestVoteResponse(msg) => Ok(Response::new(msg)),
+                    _ => Err(Status::new(tonic::Code::Unknown, "hm something went wrong")),
+                }
+            }
             None => Err(Status::new(tonic::Code::Unknown, "hm something went wrong")),
         }
     }
