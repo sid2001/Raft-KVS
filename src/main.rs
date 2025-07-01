@@ -7,6 +7,7 @@ use core::fmt;
 use proto::raft_rpc_client::RaftRpcClient;
 use proto::raft_rpc_server::{RaftRpc, RaftRpcServer};
 use proto::{AppendEntry, AppendEntryResponse, RequestVote, RequestVoteResponse};
+use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
@@ -37,7 +38,7 @@ trait RPCResponse {}
 
 const DEFAULT_CHANNEL_CAPACITY: u32 = 32;
 const DEFAULT_HEART_BEAT_PERIOD: u64 = 50;
-const DEFAULT_TIME_OUT_PERIOD: u64 = 5000;
+const DEFAULT_TIME_OUT_PERIOD: u64 = 2000;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 enum State {
@@ -117,7 +118,7 @@ struct Raft {
     voted_for: Option<u64>,
     logger: Arc<Mutex<Logger>>,
 
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     votes: u64, // do we need mutex on this??
     majority: u64,
     servers: HashMap<u64, AgentLink>,
@@ -134,7 +135,7 @@ impl Default for Raft {
             majority: 0, // todo this zero value looks waste; maybe change it to Option::None
             servers: HashMap::new(),
             logger: Arc::new(Mutex::new(Logger::default())),
-            state: Mutex::new(State::Follower),
+            state: Arc::new(Mutex::new(State::Follower)),
             config: None,
         }
     }
@@ -149,30 +150,50 @@ impl Display for MyError {
     }
 }
 
+fn check_state_leader(state: watch::Receiver<State>) -> bool {
+    //println!("checking state leader");
+    let ans = *state.borrow() == State::Leader;
+    //println!("{:?}", ans);
+    ans
+}
+
+fn check_state_follower_not(state: watch::Receiver<State>) -> bool {
+    //println!("checking state follower not");
+    let ans = *state.borrow() != State::Follower;
+    //println!("not follower: {:?}", ans);
+    ans
+}
+
 async fn serve_server(
     mut sa: ServerAgent,
     logger: Arc<Mutex<Logger>>,
     term: Arc<Mutex<u64>>,
+    state: Arc<Mutex<State>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     //let (tx, rx) = oneshot::channel();
     println!("Server Agent spawned");
     loop {
-        if *sa.watch_state.borrow() == State::Follower {
-            time::sleep_until(Instant::now() + Duration::from_millis(100)).await;
-            continue;
-        }
+        //let watch_state = *sa.watch_state.borrow();
+        //if watch_state == State::Follower {
+        //    time::sleep_until(Instant::now() + Duration::from_millis(100)).await;
+        //    continue;
+        //}
         let ae = sa.channel_ae.recv();
         let rv = sa.channel_rv.recv();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let heartbeat = time::sleep_until(deadline);
         tokio::pin!(rv);
+        tokio::pin!(heartbeat);
         tokio::pin!(ae);
 
         tokio::select! {
             biased;
 
             Some(request_v) = rv => {
+                if !check_state_follower_not(sa.watch_state.clone()) {continue;}
                 println!("Request vote(SA)");
                 // resetting server agents' volatile states
-                sa.next_index = {logger.lock().unwrap().get_prev_log_index() + 1};
+                sa.next_index = logger.lock().unwrap().get_prev_log_index() + 1;
                 sa.match_index = 0;
 
                 match RaftRpcClient::connect(sa.endpoint.clone().timeout(Duration::from_millis(500))).await {
@@ -196,7 +217,29 @@ async fn serve_server(
                 drop(request_v.sender);
             }
             Some(_entry) = ae =>{},
+            () = heartbeat => {
+                if !check_state_leader(sa.watch_state.clone()) {continue;}
+                //println!("watch state {:?}",(watch_state == State::Leader));
+                match RaftRpcClient::connect(sa.endpoint.clone().timeout(Duration::from_millis(500))).await {
+                    Ok(mut client) => {
+                        //println!("lub dub");
+                        let ae = AppendEntry{
+                                term: *term.lock().unwrap(),
+                                leader_id: 0,
+                                prev_log_term:0,
+                                prev_log_index: 0,
+                                entries: vec![],
+                                leader_commit: 0
+                            };
+                        client.append_entries_rpc(ae).await?;
+                    }
+                    Err(_) => {
+                        eprintln!("Couldn't connect with the server");
+                    }
+                };
+            },
             else => {
+                println!("getting skipped flag");
                 continue;
             }
         }
@@ -268,6 +311,7 @@ impl Raft {
             time::sleep_until(Instant::now() + Duration::from_millis(DEFAULT_HEART_BEAT_PERIOD));
 
         let (tx_ws, rx_ws) = watch::channel(*(self.state.lock().unwrap()));
+        tx_ws.send(State::Follower);
 
         tokio::pin!(heartbeat);
 
@@ -298,21 +342,36 @@ impl Raft {
                 sa,
                 self.logger.clone(),
                 self.current_term.clone(),
+                self.state.clone(),
             ));
         }
 
         loop {
-            let timeout =
-                time::sleep_until(Instant::now() + Duration::from_millis(DEFAULT_TIME_OUT_PERIOD));
+            let interval = rand::random_range(5000..=6000);
+            let timeout = time::sleep_until(Instant::now() + Duration::from_millis(interval));
             tokio::pin!(timeout);
-
+            {
+                let state = self.state.lock().unwrap();
+                let logger = self.logger.lock().unwrap();
+                let term = self.current_term.lock().unwrap();
+                print!("\x1B[2J\x1B[H"); // ANSI escape: clear screen + move cursor to top-left
+                println!("===== Raft Node [{}] State =====", self.id);
+                println!("Role           : {:?}", *state);
+                println!("Current Term   : {}", *term);
+                println!("Voted For      : {:?}", self.voted_for);
+                println!("Commit Index   : ");
+                //println!("Last Applied   : {}", state.last_applied);
+                //println!("Log Entries    : {}", state.log_len);
+            }
             tokio::select! {
-                biased;
+                //biased;
                 // this is prone to stall if lock is contented hopefully this lock is only used
                 // when changing state or reading which has to be exclusive among each ohter so the
                 // contention good in this scenario as the other recv branch also depends on lock
                 // state
-                () = &mut timeout, if *(self.state.lock().unwrap()) != State::Leader => {
+                () = &mut timeout => {
+                    if *(self.state.lock().unwrap()) == State::Leader {continue;}
+
                     // todo re-code this portion to listen to incoming request votes from other
                     // candidates maybe this work perfectly say this server has timedout and voted
                     // for itself so any other vote request should be reject by this one also if
@@ -324,16 +383,23 @@ impl Raft {
                     // automatically as the server will again become a leader
                     println!("Oh timer expired do something please onicha!!");
                     {*self.state.lock().unwrap() = State::Candidate; // --wrap
+                    println!("flag 1");
                     *self.current_term.lock().unwrap() += 1;}
+                    println!("flag 2");
                     self.votes = 1;
-                    tx_ws.send(State::Candidate);
+                    if let Err(_) = tx_ws.send(State::Candidate) {
+                        println!("watch couldnt update");
+                    }
 
                     self.voted_for = Some(self.id);
                     let (tx, mut rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY as usize); // make the default channel capacity into number of servers it is waiting for
                     for (_, agt_link) in &self.servers {
                         if let Some(ref ch) = agt_link.channel_rv {
+                            println!("flag3");
                             let logger = self.logger.lock().unwrap();
+                            println!("flag4");
                             let term = self.current_term.lock().unwrap();
+                            println!("flag5");
                             let request = Msg::RequestVote(
                                 RequestVote {
                                     term: *term,
@@ -343,19 +409,25 @@ impl Raft {
                                 }
                             );
                             drop(logger);
-                            ch.send(RequestMsg {
+                            drop(term);
+                            if let Err(_) = ch.send(RequestMsg {
                                 msg: request,
                                 sender: tx.clone()
-                            }).await;
+                            }).await {
+                                println!("send error rv from heart to sa");
+                            }
+                            println!("flag8")
                         }
                     }
                     drop(tx);
                     loop {
+                        println!("flag9 {:?}",*rx_ws.borrow());
                         // it should wait for some time for the vote responses before the timeout
                         // timeout will be detected once all the server agents waiting for response
                         // gets timed out and returns a false response; enough failed responses
                         // will fail achieving majority votes
                         if let Some(res) = rx.recv().await {
+                            println!("flag10");
                             match res {
                                 ResponseMsg::RequestVoteResponse(v_res) => {
                                     let mut state = self.state.lock().unwrap();
@@ -391,15 +463,24 @@ impl Raft {
                             //timeout.as_mut().reset(Instant::now() + Duration::from_millis(10000));
                             break;
                         }
+                        println!("flag6");
                     }
+                    println!("flag7");
                 },
-                () = &mut heartbeat, if *(self.state.lock().unwrap()) == State::Leader => {
-                    heartbeat.as_mut().reset(Instant::now() + Duration::from_millis(DEFAULT_TIME_OUT_PERIOD));
-                    //self.handle_heartbeat().await?;
-                },
-                _req = ch_ae.recv() => {
-
-                    //timeout.as_mut().reset(Instant::now() + Duration::from_millis(DEFAULT_TIME_OUT_PERIOD));
+                Some(req) = ch_ae.recv() => {
+                    println!("heartbeat");
+                    match req.msg {
+                            Msg::AppendEntry(e) => {
+                                if Raft::term_checker_greater(*self.current_term.lock().unwrap(),e.term) {
+                                    *self.state.lock().unwrap() = State::Follower;
+                                    tx_ws.send(State::Follower);
+                                    *self.current_term.lock().unwrap() = e.term;
+                                }
+                                let res = AppendEntryResponse{term: 0,success: true, candidate_id: self.id};
+                                req.sender.send(ResponseMsg::AppendEntryResponse(res)).await?;
+                            },
+                            _ => ()
+                        }
                 },
                 Some(req) = ch_rv.recv() => {
                     match req.msg {
@@ -456,6 +537,10 @@ impl Raft {
                         },
                         _ => ()
                     }
+                },
+                else => {
+                    println!("heart select else");
+                    continue;
                 }
             }
         }
@@ -502,9 +587,34 @@ impl RaftRpc for RPCServer {
     }
     async fn append_entries_rpc(
         &self,
-        _request: Request<AppendEntry>,
+        request: Request<AppendEntry>,
     ) -> Result<Response<AppendEntryResponse>, Status> {
-        Err(Status::new(tonic::Code::Ok, "Nah"))
+        let (tx, mut rx) = mpsc::channel::<ResponseMsg>(DEFAULT_CHANNEL_CAPACITY as usize);
+        println!("AppendEntry incoming");
+        match self
+            .sender_ae
+            .send(RequestMsg {
+                msg: Msg::AppendEntry(request.get_ref().clone()),
+                sender: tx,
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                println!("{:?}", e);
+                todo!();
+            }
+        }
+        match rx.recv().await {
+            Some(v) => {
+                println!("ae res received");
+                match v {
+                    ResponseMsg::AppendEntryResponse(msg) => Ok(Response::new(msg)),
+                    _ => Err(Status::new(tonic::Code::Unknown, "hm something went wrong")),
+                }
+            }
+            None => Err(Status::new(tonic::Code::Unknown, "hm something went wrong")),
+        }
     }
 }
 
