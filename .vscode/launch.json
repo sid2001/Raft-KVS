@@ -1,0 +1,47 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug Raft Server 1",
+      "cargo": {
+        "args": [
+          "build",
+          "--bin=raft",
+          "--package=raft",
+        ]
+      },
+      "args": ["1"],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug Raft Server 2",
+      "cargo": {
+        "args": [
+          "run",
+          "--bin=raft",
+          "--package=raft",
+        ]
+      },
+      "args": ["2"],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug Raft Server 3",
+      "cargo": {
+        "args": [
+          "run",
+          "--bin=raft",
+          "--package=raft",
+        ]
+      },
+      "args": ["3"],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

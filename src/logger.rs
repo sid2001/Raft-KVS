@@ -167,4 +167,18 @@ impl Logger {
             false
         }
     }
+    pub(crate) fn insert(&mut self, entry: LogEntry<MiniRedisRequest>) {
+        let len = self.log.0.len() as u64;
+        if len < self.next_index + 1 {
+            self.prev_log_term = entry.term;
+            self.log.0.push(entry);
+            self.next_index = len;
+            self.prev_log_index = len - 1;
+        } else {
+            self.prev_log_index = entry.term;
+            self.log.0[self.next_index as usize] = entry;
+            self.prev_log_index = self.next_index;
+            self.next_index += 1;
+        }
+    }
 }
