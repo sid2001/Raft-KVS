@@ -20,10 +20,13 @@ message RequestVoteResponse {
   uint64 candidate_id = 3;
 }
 
+message Data {
+  uint64 value = 1;
+}
 
 message Entry {
   uint64 term = 1;
-  uint64 data = 2;
+  Data data = 2;
 }
 
 message AppendEntry {
@@ -31,7 +34,7 @@ message AppendEntry {
   uint64 leader_id       = 2;
   uint64 prev_log_index  = 3;
   uint64 prev_log_term   = 4;
-  uint64 leader_commit   = 5; // leader's commit index
+  uint64 commit_index   = 5; // leader's commit index
   repeated Entry entries = 6;
 }
 

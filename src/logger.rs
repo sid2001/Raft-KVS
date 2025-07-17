@@ -11,7 +11,7 @@ struct MiniRedis;
 impl Store for MiniRedis {}
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MiniRedisRequest {
-    pub data: u32, // dummy data
+    pub data: u64, // dummy data
 }
 impl Data for MiniRedisRequest {}
 use std::fmt::Debug;
@@ -40,10 +40,11 @@ pub(crate) struct Logger {
     // index of highest log entry known to be committed (initialized to 0, increases monotonically)
     commit_index: u64,
 
+    // these log indexes are just to track the index of latest entry and next index entry
     prev_log_index: u64,
     prev_log_term: u64,
-
     next_index: u64,
+
     buffer_log: bool,
     prev_persist_index: u64,
     log_file: Option<File>,
@@ -167,17 +168,33 @@ impl Logger {
             false
         }
     }
-    pub(crate) fn insert(&mut self, entry: LogEntry<MiniRedisRequest>) {
-        let len = self.log.0.len() as u64;
-        if len < self.next_index + 1 {
+
+    // checks if entry exists at the given index and return its term or false
+    pub(crate) fn get_entry_term_at(&self, idx: u64) -> Option<u64> {
+        if self.log.0.len() as u64 > idx {
+            Some(self.log.0[idx as usize].term)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn get_commit_index(&self) -> u64 {
+        self.commit_index
+    }
+
+    pub(crate) fn commit(&mut self, _idx: u64) -> Result<(), ()> {
+        Ok(())
+    }
+
+    pub(crate) fn insert_from(&mut self, idx: u64, entries: Vec<LogEntry<MiniRedisRequest>>) {
+        self.log.0.truncate(idx as usize); // remove all the following entries which are invalid
+        self.prev_log_index = idx - 1;
+        self.next_index = idx;
+
+        for entry in entries {
             self.prev_log_term = entry.term;
             self.log.0.push(entry);
-            self.next_index = len;
-            self.prev_log_index = len - 1;
-        } else {
-            self.prev_log_index = entry.term;
-            self.log.0[self.next_index as usize] = entry;
-            self.prev_log_index = self.next_index;
+            self.prev_log_index += 1;
             self.next_index += 1;
         }
     }

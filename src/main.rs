@@ -6,7 +6,9 @@ use config::Config;
 use core::fmt;
 use proto::raft_rpc_client::RaftRpcClient;
 use proto::raft_rpc_server::{RaftRpc, RaftRpcServer};
-use proto::{AppendEntry, AppendEntryResponse, RequestVote, RequestVoteResponse};
+use proto::{
+    self as proto_types, AppendEntry, AppendEntryResponse, RequestVote, RequestVoteResponse,
+};
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -17,7 +19,7 @@ use std::net::SocketAddr;
 use std::process::Output;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread::sleep;
+use std::thread::{sleep, yield_now};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{oneshot, watch};
 use tokio::time::{self, sleep_until, timeout, Duration, Instant};
@@ -39,6 +41,9 @@ trait RPCResponse {}
 const DEFAULT_CHANNEL_CAPACITY: u32 = 32;
 const DEFAULT_HEART_BEAT_PERIOD: u64 = 50;
 const DEFAULT_TIME_OUT_PERIOD: u64 = 2000;
+
+type Term = u64;
+type Index = u64;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 enum State {
@@ -76,6 +81,21 @@ struct RequestMsg<T: RPCResponse> {
     sender: mpsc::Sender<T>,
 }
 
+impl proto_types::Entry {
+    fn as_log_entry(entries: Vec<proto_types::Entry>) -> Vec<LogEntry<MiniRedisRequest>> {
+        let mut vec = vec![];
+        vec.reserve(entries.len());
+        for entry in entries {
+            vec.push(LogEntry {
+                term: entry.term,
+                data: MiniRedisRequest {
+                    data: entry.data.unwrap().value, // why the duck is this an option
+                },
+            });
+        }
+        vec
+    }
+}
 //#[derive(Debug)]
 //struct Peer(Endpoint);
 
@@ -83,13 +103,13 @@ struct RequestMsg<T: RPCResponse> {
 struct ServerAgent {
     // for each server, index of the next log entry to send to that server (initialised to leader
     // last log index + 1)
-    next_index: u64,
+    next_index: Index,
 
     // for each server index, of highest log entry known to be replicated on server (initialized to
     // 0, increases monotonically)
-    match_index: u64,
+    match_index: Index,
 
-    term: u64,
+    term: Term,
 
     endpoint: Endpoint,
 
@@ -290,7 +310,8 @@ impl Raft {
     }
 
     // acquire multiple lock (current_term, logger, state)
-    fn acquire_tls(&self) -> Option<(MutexGuard<u64>, MutexGuard<Logger>, MutexGuard<State>)> {
+    // todo remove this and maintain global order of locks and use tokio async mutex
+    fn acquire_tls(&self) -> Option<(MutexGuard<Term>, MutexGuard<Logger>, MutexGuard<State>)> {
         if let Ok(term) = self.current_term.try_lock() {
             if let Ok(logger) = self.logger.try_lock() {
                 if let Ok(state) = self.state.try_lock() {
@@ -307,31 +328,19 @@ impl Raft {
         None
     }
 
-    async fn request_validator_ae(&self, request: AppendEntry) -> bool {
+    fn request_validator_ae(logger: &Logger, request: &AppendEntry) -> bool {
         // rules
         // if term < current_term return false
         // if there is no entry at prev_log_index whose term is same as prev_log_term in request return false
 
-        let (mut current_term, logger, mut state) = {
-            loop {
-                if let Some(guards) = self.acquire_tls() {
-                    break guards;
-                }
-                tokio::task::yield_now().await; // todo ask someone if it's safe and logically correct
+        if let Some(term) = logger.get_entry_term_at(request.prev_log_index) {
+            if term == request.prev_log_term {
+                return true;
             }
-        };
-
-        // if follower term is greater then simply reject the request
-        if request.term > *current_term {
+            return false;
+        } else {
             return false;
         }
-
-        if logger.get_prev_log_index() < request.prev_log_index {
-            // log entry doesn't exist
-            return false;
-        } else if 
-
-        return true;
     }
 
     fn term_checker_greater(current_term: u64, term: u64) -> bool {
@@ -494,7 +503,7 @@ impl Raft {
                             //println!("flag10");
                             match res {
                                 ResponseMsg::RequestVoteResponse(v_res) => {
-                                    let mut state = self.state.lock().unwrap();
+                                    let mut state = self.state.lock().unwrap(); // todo acquire all locks or none
                                     let mut term = self.current_term.lock().unwrap();
                                     println!("Received res msg from sa term {}, cand {} granted {} curr_term {}",v_res.term,v_res.candidate_id,v_res.vote_granted, *term);
                                     if Raft::term_checker_greater(*term,v_res.term) {
@@ -535,12 +544,32 @@ impl Raft {
                     println!("heartbeat");
                     match req.msg {
                             Msg::AppendEntry(e) => {
-                                if Raft::term_checker_greater(*self.current_term.lock().unwrap(),e.term) {
-                                    *self.state.lock().unwrap() = State::Follower;
+                                let mut res;
+                                let (mut term, mut logger, mut state) = {
+                                    loop {
+                                        if let Some(guards) = self.acquire_tls() {
+                                            break guards;
+                                        }
+                                        tokio::time::interval(Duration::from_nanos(10)).tick().await; // this should take off the task from run queue though 1ms is big value
+                                    }
+                                };
+                                if Raft::term_checker_greater(*term,e.term) {
+                                    *state = State::Follower;
+                                    *term = e.term;
                                     tx_ws.send(State::Follower);
-                                    *self.current_term.lock().unwrap() = e.term;
                                 }
-                                let res = AppendEntryResponse{term: 0,success: true, candidate_id: self.id};
+                                if *term == e.term && Raft::request_validator_ae(&(*logger), &e) {
+                                    if e.entries.len() > 0 {
+                                        logger.insert_from(e.prev_log_index + 1,proto_types::Entry::as_log_entry(e.entries));
+                                        if e.commit_index > logger.get_commit_index() {
+                                            logger.commit(e.commit_index);
+                                        }
+                                    } // start here
+                                    res = AppendEntryResponse {term: *term, success: true, candidate_id: self.id};
+                                } else {
+                                    res = AppendEntryResponse {term: *term, success: false, candidate_id: self.id};
+                                }
+
                                 req.sender.send(ResponseMsg::AppendEntryResponse(res)).await?;
                             },
                             _ => ()
