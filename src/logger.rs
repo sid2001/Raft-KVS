@@ -1,5 +1,6 @@
 use crate::config::LogConfig;
 use serde::{Deserialize, Serialize};
+use std::cmp::min;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
@@ -9,7 +10,7 @@ use std::io::{BufReader, BufWriter};
 #[derive(Debug)]
 struct MiniRedis;
 impl Store for MiniRedis {}
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MiniRedisRequest {
     pub data: u64, // dummy data
 }
@@ -20,7 +21,7 @@ type Term = u64;
 pub(crate) trait Data {}
 trait Store: Sync + Send + Debug {}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct LogEntry<T: Data> {
     pub term: Term,
     pub data: T,
@@ -112,7 +113,8 @@ impl Logger {
         *log = Log(out);
         Ok(len)
     }
-    pub(crate) fn persist_log(&mut self) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn persist_log(&mut self, idx: u64) -> Result<(), Box<dyn Error>> {
+        // takes the index and saves log upto the index
         println!("Persist log");
         let f = if let Some(ref file) = &self.log_file {
             Some(file)
@@ -130,10 +132,18 @@ impl Logger {
         }
         let mut buf_writer = BufWriter::new(f.unwrap());
 
-        let data = &self.log.0.as_slice()[self.prev_persist_index as usize + 1..];
+        let data = &self.log.0.as_slice()[self.prev_persist_index as usize + 1..idx as usize + 1];
         for d in data {
             let _ = bincode::serialize_into(&mut buf_writer, d)?;
+            self.prev_persist_index += 1;
         }
+        // check if all the log entry is stored
+        assert!(
+            self.prev_persist_index == idx,
+            "failed to persist log upto {} expected {}",
+            self.prev_persist_index,
+            idx
+        );
         Ok(())
     }
     pub(crate) fn get_empty_append_entry(&self) -> LogAppendEntry {
@@ -182,8 +192,28 @@ impl Logger {
         self.commit_index
     }
 
-    pub(crate) fn commit(&mut self, _idx: u64) -> Result<(), ()> {
+    pub(crate) fn commit(&mut self, idx: u64) -> Result<(), Box<dyn Error>> {
+        // if idx > commit_index, commit_index = min(idx, index_of_last_entry)
+        if self.buffer_log == false {
+            self.persist_log(min(idx, self.prev_log_index))?;
+            self.commit_index = self.prev_persist_index;
+        } else {
+            // this section handles late persistent storage for performance
+            todo!();
+        }
         Ok(())
+    }
+
+    pub(crate) fn get_log_at_index(&self, idx: u64) -> Result<LogEntry<MiniRedisRequest>, ()> {
+        if idx < self.log.0.len() as u64 {
+            Ok(self.log.0[idx as usize].clone())
+        } else {
+            Err(())
+        }
+    }
+
+    pub(crate) fn is_log_empty(&self) -> bool {
+        self.log.0.len() == 0
     }
 
     pub(crate) fn insert_from(&mut self, idx: u64, entries: Vec<LogEntry<MiniRedisRequest>>) {

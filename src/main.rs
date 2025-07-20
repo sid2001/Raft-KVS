@@ -95,6 +95,19 @@ impl proto_types::Entry {
         }
         vec
     }
+    fn as_entry(entries: Vec<LogEntry<MiniRedisRequest>>) -> Vec<proto_types::Entry> {
+        let mut vec = vec![];
+        vec.reserve(entries.len());
+        for entry in entries {
+            vec.push(proto_types::Entry {
+                term: entry.term,
+                data: Some(proto_types::Data {
+                    value: entry.data.data,
+                }),
+            });
+        }
+        vec
+    }
 }
 //#[derive(Debug)]
 //struct Peer(Endpoint);
@@ -248,20 +261,50 @@ async fn serve_server(
                 match RaftRpcClient::connect(sa.endpoint.clone().timeout(Duration::from_millis(500))).await {
                     Ok(mut client) => {
                         //println!("lub dub");
-                        let ae = AppendEntry{
+                        let (prev_log_term, entries, commit_index) = {
+                            let logger = logger.lock().unwrap();
+                            let commit_index = logger.get_commit_index();
+                            //println!("next index {}", sa.next_index);
+                            let mut term = 0;
+                            if sa.next_index > 0 {
+                                if let Some(t) = logger.get_entry_term_at(sa.next_index - 1) {
+                                // it is assured that log exists at this index except when empty
+                                    term = t;
+                                }
+                            }
+                            let entries = if !logger.is_log_empty() && logger.get_prev_log_index() >= sa.next_index {
+                                    // todo -- for now sends entries one by one this can be
+                                    // optimised to send multiple entries at once
+                                    proto_types::Entry::as_entry(vec![logger.get_log_at_index(sa.next_index).unwrap()])
+                                } else {
+                                    vec![]
+                                };
+                            (term, entries, commit_index)
+                        };
+                        let ae = AppendEntry {
                                 term: *term.lock().unwrap(),
                                 leader_id: 0,
-                                prev_log_term:0,
-                                prev_log_index: 0,
-                                entries: vec![],
-                                leader_commit: 0
+                                prev_log_term,
+                                prev_log_index: if sa.next_index > 0 {sa.next_index - 1}else{0},
+                                entries,
+                                commit_index
                             };
                         match client.append_entries_rpc(ae).await {
                             Ok(res) => {
                                 let entry = res.into_inner();
                                 if !entry.success {
-                                    let _ = sa.channel_reset.send(entry.term).await;
+                                    //println!("failed ae for index {} ",sa.next_index);
+                                    sa.next_index = if sa.next_index > 0{sa.next_index -1}else{0};
+                                }else{
+                                    sa.match_index = sa.next_index;
+                                    sa.next_index += 1;
                                 }
+                                // start here
+                                // now make append entries to be send on request
+                                // make indexing start from 1 and have invalid index as 0; empty
+                                    // logs are creating issues
+                                // remove unecessary locks and bring global lock ordering
+                                // use tokio async locks
                             },
                             Err(err) => {
                                     eprintln!("Something went wrong while sending ae(heartbeat) rpc request {:?}",err);
@@ -316,12 +359,7 @@ impl Raft {
             if let Ok(logger) = self.logger.try_lock() {
                 if let Ok(state) = self.state.try_lock() {
                     return Some((term, logger, state));
-                } else {
-                    drop(logger);
-                    drop(term);
                 }
-            } else {
-                drop(term);
             }
         }
 
@@ -366,7 +404,7 @@ impl Raft {
             leader_id: self.id,
             prev_log_index: ae.prev_log_index,
             prev_log_term: ae.prev_log_term,
-            leader_commit: ae.commit_index,
+            commit_index: ae.commit_index,
             entries: vec![],
         }
     }
@@ -425,7 +463,7 @@ impl Raft {
             tokio::pin!(timeout);
             {
                 let state = self.state.lock().unwrap();
-                let logger = self.logger.lock().unwrap();
+                //let logger = self.logger.lock().unwrap();
                 let term = self.current_term.lock().unwrap();
                 print!("\x1B[2J\x1B[H"); // ANSI escape: clear screen + move cursor to top-left
                 println!("===== Raft Node [{}] State =====", self.id);
@@ -544,7 +582,7 @@ impl Raft {
                     println!("heartbeat");
                     match req.msg {
                             Msg::AppendEntry(e) => {
-                                let mut res;
+                                let res;
                                 let (mut term, mut logger, mut state) = {
                                     loop {
                                         if let Some(guards) = self.acquire_tls() {
@@ -569,7 +607,9 @@ impl Raft {
                                 } else {
                                     res = AppendEntryResponse {term: *term, success: false, candidate_id: self.id};
                                 }
-
+                                drop(logger);
+                                drop(state);
+                                drop(term);
                                 req.sender.send(ResponseMsg::AppendEntryResponse(res)).await?;
                             },
                             _ => ()
@@ -584,27 +624,33 @@ impl Raft {
                             // todo another check for log term when repeated request vote is
                             // implemented
                             let res;
-                            let mut term = self.current_term.lock().unwrap();
-                            let mut state = self.state.lock().unwrap();
-                            let logger = self.logger.lock().unwrap();
+                            let (mut term, mut logger, mut state) = {
+                                loop {
+                                    if let Some(guards) = self.acquire_tls() {
+                                        break guards;
+                                    }
+                                    tokio::time::interval(Duration::from_nanos(10)).tick().await; // this should take off the task from run queue though 1ms is big value
+                                }
+                            };
+                            let mut voted_for = self.voted_for;
                             if Raft::term_checker_greater(*term, r.term){
                                 *term = r.term;
                                 *state = State::Follower;
-                                self.voted_for = None;
+                                voted_for = None;
                                 //timeout.reset(Instant::now() + Duration::from_millis(DEFAULT_TIME_OUT_PERIOD));
 
                                 if logger.log_index_term_checker(r.last_log_index, r.last_log_term) {
                                     // ---yes
-                                    self.voted_for = Some(r.candidate_id);
+                                    voted_for = Some(r.candidate_id);
                                     res = ResponseMsg::new_vr(r.term, true,self.id);
                                 } else {
                                     // --no
                                     res = ResponseMsg::new_vr(r.term, false,self.id);
                                 }
                             } else if Raft::term_checker_equal(*term, r.term) {
-                                if (self.voted_for.is_none() && logger.log_index_term_checker(r.last_log_index,r.last_log_term)) || (self.voted_for.unwrap() == r.candidate_id && logger.log_index_term_checker_equal(r.last_log_index, r.last_log_term)) {
+                                if (voted_for.is_none() && logger.log_index_term_checker(r.last_log_index,r.last_log_term)) || (voted_for.unwrap() == r.candidate_id && logger.log_index_term_checker_equal(r.last_log_index, r.last_log_term)) {
                                     // --yes
-                                    self.voted_for = Some(r.candidate_id);
+                                    voted_for = Some(r.candidate_id);
                                     res = ResponseMsg::new_vr(r.term, true, self.id);
                                     //timeout.reset(Instant::now() + Duration::from_millis(DEFAULT_TIME_OUT_PERIOD));
                                 } else {
@@ -615,11 +661,15 @@ impl Raft {
                                 // --no
                                 res = ResponseMsg::new_vr(*term, false, self.id);
                             }
-                            if self.voted_for.is_none() || self.voted_for.unwrap() != self.id {
+                            if voted_for.is_none() || voted_for.unwrap() != self.id {
                                 *state = State::Follower;
                             }
                             tx_ws.send((*state).clone());
                             println!("evaluation completed");
+                            drop(logger);
+                            drop(state);
+                            drop(term);
+                            self.voted_for = voted_for;
                             match req.sender.send(res).await {
                                 Err(err) => {
                                     println!("Can't send response to rpc handler!!");
